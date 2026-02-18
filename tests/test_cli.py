@@ -123,3 +123,11 @@ def test_cli_disabling_import_hash_parsing():
     assert result.exit_code == 0
     json_results = json.loads(result.output.strip())
     assert json_results["imphashes"] == ["18ddf28a71089acdbab5038f58044c0a"]
+
+
+def test_cli_include_positions():
+    runner = CliRunner()
+    result = runner.invoke(ioc_finder.cli_find_iocs, ["example.com", "--include_positions"])
+    assert result.exit_code == 0
+    json_results = json.loads(result.output.strip())
+    assert json_results["domains"] == [{"value": "example.com", "positions": [[0, 11]]}]

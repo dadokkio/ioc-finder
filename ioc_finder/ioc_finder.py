@@ -1,8 +1,10 @@
 """Python package for finding observables in text."""
 
 import json
+import re
 import urllib.parse as urlparse
-from typing import Callable, Dict, Iterable, List, Mapping, Union
+from typing import Any
+from collections.abc import Callable, Iterable, Mapping
 
 import click
 import ioc_fanger
@@ -11,10 +13,10 @@ from pyparsing import ParseResults
 
 from ioc_finder import ioc_grammars
 
-IndicatorList = List[str]
-IndicatorDict = Dict[str, IndicatorList]
+IndicatorList = list[str]
+IndicatorDict = dict[str, IndicatorList]
 # using `Mapping` b/c it is covariant (https://mypy.readthedocs.io/en/stable/generics.html#variance-of-generic-types)
-IndicatorData = Mapping[str, Union[IndicatorList, IndicatorDict]]
+IndicatorData = Mapping[str, IndicatorList | IndicatorDict | list[dict[str, Any]]]
 
 DEFAULT_IOC_TYPES = [
     "asns",
@@ -49,21 +51,46 @@ DEFAULT_IOC_TYPES = [
 ]
 
 
-def _deduplicate(indicator_list: Iterable) -> List:
+def _deduplicate(indicator_list: Iterable) -> list:
     """Deduplicate the list of observables."""
     return list(set(indicator_list))
 
 
-def _listify(indicator_list: ParseResults) -> List:
+def _listify(indicator_list: ParseResults) -> list:
     """Convert the multi-dimensional list into a one-dimensional list with empty entries and duplicates removed."""
-    return _deduplicate([indicator[0] for indicator in indicator_list if indicator[0]])
+    return list({indicator[0] for indicator in indicator_list if indicator[0]})
 
 
-def _remove_items(items: List[str], text: str) -> str:
+def _listify_with_positions(scan_results: Iterable) -> list[dict]:
+    """Convert the scan results into a list of dictionaries with value and positions."""
+    grouped = {}
+    for tokens, start, end in scan_results:
+        if val := tokens[0]:
+            if val not in grouped:
+                grouped[val] = []
+            grouped[val].append((start, end))
+    return [{"value": k, "positions": sorted(list(set(v)))} for k, v in grouped.items()]
+
+
+def _remove_items(items: list[str], text: str) -> str:
     """Remove each item from the text."""
-    for item in items:
-        text = text.replace(item, " ")
-    return text
+    if not items:
+        return text
+    # Sort by length descending to ensure longer matches are replaced first
+    sorted_items = sorted(set(items), key=len, reverse=True)
+    # Create a regex pattern to match any of the items
+    pattern = re.compile("|".join(map(re.escape, sorted_items)))
+    # Replace with spaces of the same length to preserve positions for subsequent searches
+    return pattern.sub(lambda m: " " * len(m.group(0)), text)
+
+
+def _extract_values(indicators: list) -> list[str]:
+    """Extract values from a list of indicators which might be strings or dicts."""
+    if not indicators:
+        return []
+    if isinstance(indicators[0], dict) and "value" in indicators[0]:
+        return [i["value"] for i in indicators]
+    return indicators
 
 
 def _get_items(
@@ -83,9 +110,8 @@ def prepare_text(text: str) -> str:
     """Prepare the text for parsing.
 
     Currently, this involves fanging (https://ioc-fang.hightower.space/) the text."""
-    text = ioc_fanger.fang(text)
     # text = text.encode('idna').decode('utf-8')
-    return text
+    return ioc_fanger.fang(text)
 
 
 def _clean_url(url: str) -> str:
@@ -104,12 +130,26 @@ def _clean_url(url: str) -> str:
     return url
 
 
-def parse_urls(text: str, *, parse_urls_without_scheme: bool = True) -> List:
+def parse_urls(text: str, *, parse_urls_without_scheme: bool = True, include_positions: bool = False) -> list:
     """."""
+    grammar = ioc_grammars.scheme_less_url if parse_urls_without_scheme else ioc_grammars.url
+
+    if include_positions:
+        grouped = {}
+        for tokens, start, _ in grammar.scan_string(text):
+            raw_url = tokens[0]
+            if not raw_url:
+                continue
+            if clean_url := _clean_url(raw_url):
+                if clean_url not in grouped:
+                    grouped[clean_url] = []
+                grouped[clean_url].append((start, start + len(clean_url)))
+        return [{"value": k, "positions": sorted(list(set(v)))} for k, v in grouped.items()]
+
     if parse_urls_without_scheme:
-        url_parse_results = ioc_grammars.scheme_less_url.searchString(text)
+        url_parse_results = ioc_grammars.scheme_less_url.search_string(text)
     else:
-        url_parse_results = ioc_grammars.url.searchString(text)
+        url_parse_results = ioc_grammars.url.search_string(text)
     urls = _listify(url_parse_results)
 
     clean_urls = map(_clean_url, urls)
@@ -118,140 +158,204 @@ def parse_urls(text: str, *, parse_urls_without_scheme: bool = True) -> List:
     return _deduplicate(clean_urls)
 
 
-def _remove_url_domain_name(urls: List, text) -> str:
+def _remove_url_domain_name(urls: list, text) -> str:
     """Remove the domain name of each url from the text."""
+    domains_to_remove = []
     for url in urls:
-        parsed_url = ioc_grammars.scheme_less_url.parseString(url)
-        text = text.replace(parsed_url.url_authority, " ")
-    return text
+        parsed_url = ioc_grammars.scheme_less_url.parse_string(url)
+        domains_to_remove.append(parsed_url.url_authority)
+    return _remove_items(domains_to_remove, text)
 
 
-def _remove_url_paths(urls: List, text: str) -> str:
+def _remove_url_paths(urls: list, text: str) -> str:
     """Remove the path of each url from the text."""
+    paths_to_remove = []
     for url in urls:
-        parsed_url = ioc_grammars.scheme_less_url.parseString(url)
+        parsed_url = ioc_grammars.scheme_less_url.parse_string(url)
         url_path = urlparse.unquote_plus(parsed_url.url_path)
 
         is_cidr_range = parse_ipv4_cidrs(str(url))
         # if the 'url' has a URL path and is not a cidr range, remove the url_path
         if not is_cidr_range and len(url_path) > 1:
-            text = text.replace(url_path, " ")
-    return text
+            paths_to_remove.append(url_path)
+    return _remove_items(paths_to_remove, text)
 
 
-def _percent_decode_url(urls: List, text: str) -> str:
+def _percent_decode_url(urls: list, text: str) -> str:
     for url in urls:
         text = text.replace(url, urlparse.unquote_plus(url))
     return text
 
 
-def parse_domain_names(text):
+def parse_domain_names(text, include_positions=False):
     """."""
-    domains = ioc_grammars.domain_name.searchString(text.lower())
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.domain_name.scan_string(text.lower()))
+    domains = ioc_grammars.domain_name.search_string(text.lower())
     return _listify(domains)
 
 
-def parse_ipv4_addresses(text):
+def parse_ipv4_addresses(text, include_positions=False):
     """."""
-    addresses = ioc_grammars.ipv4_address.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.ipv4_address.scan_string(text))
+    addresses = ioc_grammars.ipv4_address.search_string(text)
     return _listify(addresses)
 
 
-def parse_ipv6_addresses(text):
+def parse_ipv6_addresses(text, include_positions=False):
     """."""
-    addresses = ioc_grammars.ipv6_address.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.ipv6_address.scan_string(text))
+    addresses = ioc_grammars.ipv6_address.search_string(text)
     return _listify(addresses)
 
 
-def parse_complete_email_addresses(text: str) -> List:
+def parse_complete_email_addresses(text: str, include_positions=False) -> list:
     """."""
-    email_addresses = ioc_grammars.complete_email_address.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.complete_email_address.scan_string(text))
+    email_addresses = ioc_grammars.complete_email_address.search_string(text)
     return _listify(email_addresses)
 
 
-def parse_email_addresses(text: str) -> List:
+def parse_email_addresses(text: str, include_positions=False) -> list:
     """."""
-    email_addresses = ioc_grammars.email_address.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.email_address.scan_string(text))
+    email_addresses = ioc_grammars.email_address.search_string(text)
     return _listify(email_addresses)
 
 
 # there is a trailing underscore on this function to differentiate it from the argument with the same name
-def parse_imphashes_(text: str) -> List:
+def parse_imphashes_(text: str, include_positions=False) -> list:
     """."""
-    full_imphash_instances = _listify(ioc_grammars.imphash.searchString(text.lower()))
+    if include_positions:
+        grouped = {}
+        for tokens, start, _ in ioc_grammars.imphash.scan_string(text.lower()):
+            if imphash_instance := tokens[0]:
+                parsed_hash = ioc_grammars.imphash.parse_string(imphash_instance).hash[0]
+                if parsed_hash not in grouped:
+                    grouped[parsed_hash] = []
+                hash_start = start + imphash_instance.find(parsed_hash)
+                grouped[parsed_hash].append((hash_start, hash_start + len(parsed_hash)))
+        return [{"value": k, "positions": sorted(list(set(v)))} for k, v in grouped.items()]
+
+    full_imphash_instances = _listify(ioc_grammars.imphash.search_string(text.lower()))
 
     imphashes = []
 
-    for imphash in full_imphash_instances:
-        imphashes.append(ioc_grammars.imphash.parseString(imphash).hash[0])
-
+    imphashes.extend(
+        ioc_grammars.imphash.parse_string(imphash).hash[0]
+        for imphash in full_imphash_instances
+    )
     return imphashes
 
 
 # there is a trailing underscore on this function to differentiate it from the argument with the same name
-def parse_authentihashes_(text: str) -> List:
+def parse_authentihashes_(text: str, include_positions=False) -> list:
     """."""
-    full_authentihash_instances = _listify(ioc_grammars.authentihash.searchString(text.lower()))
+    if include_positions:
+        grouped = {}
+        for tokens, start, _ in ioc_grammars.authentihash.scan_string(text.lower()):
+            if instance := tokens[0]:
+                parsed_hash = ioc_grammars.authentihash.parse_string(instance).hash[0]
+                if parsed_hash not in grouped:
+                    grouped[parsed_hash] = []
+                hash_start = start + instance.find(parsed_hash)
+                grouped[parsed_hash].append((hash_start, hash_start + len(parsed_hash)))
+        return [{"value": k, "positions": sorted(list(set(v)))} for k, v in grouped.items()]
+
+    full_authentihash_instances = _listify(ioc_grammars.authentihash.search_string(text.lower()))
 
     authentihashes = []
 
-    for authentihash in full_authentihash_instances:
-        authentihashes.append(ioc_grammars.authentihash.parseString(authentihash).hash[0])
-
+    authentihashes.extend(
+        ioc_grammars.authentihash.parse_string(authentihash).hash[0]
+        for authentihash in full_authentihash_instances
+    )
     return authentihashes
 
-
-def parse_md5s(text):
+def parse_md5s(text, include_positions=False):
     """."""
-    md5s = ioc_grammars.md5.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.md5.scan_string(text))
+    md5s = ioc_grammars.md5.search_string(text)
     return _listify(md5s)
 
 
-def parse_sha1s(text):
+def parse_sha1s(text, include_positions=False):
     """."""
-    sha1s = ioc_grammars.sha1.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.sha1.scan_string(text))
+    sha1s = ioc_grammars.sha1.search_string(text)
     return _listify(sha1s)
 
 
-def parse_sha256s(text):
+def parse_sha256s(text, include_positions=False):
     """."""
-    sha256s = ioc_grammars.sha256.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.sha256.scan_string(text))
+    sha256s = ioc_grammars.sha256.search_string(text)
     return _listify(sha256s)
 
 
-def parse_sha512s(text):
+def parse_sha512s(text, include_positions=False):
     """."""
-    sha512s = ioc_grammars.sha512.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.sha512.scan_string(text))
+    sha512s = ioc_grammars.sha512.search_string(text)
     return _listify(sha512s)
 
 
-def parse_ssdeeps(text):
+def parse_ssdeeps(text, include_positions=False):
     """."""
-    ssdeeps = ioc_grammars.ssdeep.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.ssdeep.scan_string(text))
+    ssdeeps = ioc_grammars.ssdeep.search_string(text)
     return _listify(ssdeeps)
 
 
-def parse_asns(text):
+def parse_asns(text, include_positions=False):
     """."""
-    asns = ioc_grammars.asn.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.asn.scan_string(text))
+    asns = ioc_grammars.asn.search_string(text)
     return _listify(asns)
 
 
-def parse_cves(text):
+def parse_cves(text, include_positions=False):
     """."""
-    cves = ioc_grammars.cve.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.cve.scan_string(text))
+    cves = ioc_grammars.cve.search_string(text)
     return _listify(cves)
 
 
-def parse_ipv4_cidrs(text: str) -> List:
+def parse_ipv4_cidrs(text: str, include_positions=False) -> list:
     """."""
-    cidrs = ioc_grammars.ipv4_cidr.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.ipv4_cidr.scan_string(text))
+    cidrs = ioc_grammars.ipv4_cidr.search_string(text)
     return _listify(cidrs)
 
 
-def parse_registry_key_paths(text):
+def parse_registry_key_paths(text, include_positions=False):
     """."""
-    parsed_registry_key_paths = ioc_grammars.registry_key_path.searchString(text)
+    if include_positions:
+        grouped = {}
+        for tokens, start, _ in ioc_grammars.registry_key_path.scan_string(text):
+            registry_key_path = tokens[0]
+            if " " in registry_key_path.split("\\")[-1]:
+                last_section = registry_key_path.split("\\")[-1]
+                registry_key_path = registry_key_path.replace(last_section, last_section.split(" ")[0])
+
+            if registry_key_path not in grouped:
+                grouped[registry_key_path] = []
+            grouped[registry_key_path].append((start, start + len(registry_key_path)))
+        return [{"value": k, "positions": sorted(list(set(v)))} for k, v in grouped.items()]
+
+    parsed_registry_key_paths = ioc_grammars.registry_key_path.search_string(text)
     full_parsed_registry_key_paths = _listify(parsed_registry_key_paths)
 
     registry_key_paths = []
@@ -263,120 +367,150 @@ def parse_registry_key_paths(text):
         if " " in registry_key_path.split("\\")[-1]:
             last_section = registry_key_path.split("\\")[-1]
             registry_key_path = registry_key_path.replace(last_section, last_section.split(" ")[0])
-            registry_key_paths.append(registry_key_path)
-        else:
-            registry_key_paths.append(registry_key_path)
-
+        registry_key_paths.append(registry_key_path)
     return registry_key_paths
 
 
-def parse_google_adsense_ids(text):
+def parse_google_adsense_ids(text, include_positions=False):
     """."""
-    adsense_publisher_ids = ioc_grammars.google_adsense_publisher_id.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.google_adsense_publisher_id.scan_string(text))
+    adsense_publisher_ids = ioc_grammars.google_adsense_publisher_id.search_string(text)
     return _listify(adsense_publisher_ids)
 
 
-def parse_google_analytics_ids(text):
+def parse_google_analytics_ids(text, include_positions=False):
     """."""
-    analytics_tracker_ids = ioc_grammars.google_analytics_tracker_id.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.google_analytics_tracker_id.scan_string(text))
+    analytics_tracker_ids = ioc_grammars.google_analytics_tracker_id.search_string(text)
     return _listify(analytics_tracker_ids)
 
 
-def parse_bitcoin_addresses(text):
+def parse_bitcoin_addresses(text, include_positions=False):
     """."""
-    bitcoin_addresses = ioc_grammars.bitcoin_address.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.bitcoin_address.scan_string(text))
+    bitcoin_addresses = ioc_grammars.bitcoin_address.search_string(text)
     return _listify(bitcoin_addresses)
 
 
-def parse_monero_addresses(text):
+def parse_monero_addresses(text, include_positions=False):
     """."""
-    monero_addresses = ioc_grammars.monero_address.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.monero_address.scan_string(text))
+    monero_addresses = ioc_grammars.monero_address.search_string(text)
     return _listify(monero_addresses)
 
 
-def parse_xmpp_addresses(text: str) -> List:
+def parse_xmpp_addresses(text: str, include_positions=False) -> list:
     """."""
-    xmpp_addresses = ioc_grammars.xmpp_address.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.xmpp_address.scan_string(text))
+    xmpp_addresses = ioc_grammars.xmpp_address.search_string(text)
     return _listify(xmpp_addresses)
 
 
-def _remove_xmpp_local_part(xmpp_addresses: List, text: str) -> str:
+def _remove_xmpp_local_part(xmpp_addresses: list, text: str) -> str:
     """Remove the local part of each xmpp_address from the text."""
-    for address in xmpp_addresses:
-        text = text.replace(address.split("@")[0] + "@", " ")
+    values = _extract_values(xmpp_addresses)
+    parts_to_remove = [address.split("@")[0] + "@" for address in values]
+    return _remove_items(parts_to_remove, text)
 
-    return text
 
-
-def parse_mac_addresses(text):
+def parse_mac_addresses(text, include_positions=False):
     """."""
-    mac_addresses = ioc_grammars.mac_address.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.mac_address.scan_string(text))
+    mac_addresses = ioc_grammars.mac_address.search_string(text)
     return _listify(mac_addresses)
 
 
-def parse_user_agents(text):
+def parse_user_agents(text, include_positions=False):
     """."""
-    user_agents = ioc_grammars.user_agent.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.user_agent.scan_string(text))
+    user_agents = ioc_grammars.user_agent.search_string(text)
     return _listify(user_agents)
 
 
-def parse_file_paths(text):
+def parse_file_paths(text, include_positions=False):
     """."""
-    file_paths = ioc_grammars.file_path.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.file_path.scan_string(text))
+    file_paths = ioc_grammars.file_path.search_string(text)
     return _listify(file_paths)
 
 
-def parse_pre_attack_tactics(text):
+def parse_pre_attack_tactics(text, include_positions=False):
     """."""
-    data = ioc_grammars.pre_attack_tactics_grammar.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.pre_attack_tactics_grammar.scan_string(text))
+    data = ioc_grammars.pre_attack_tactics_grammar.search_string(text)
     return _listify(data)
 
 
-def parse_pre_attack_techniques(text):
+def parse_pre_attack_techniques(text, include_positions=False):
     """."""
-    data = ioc_grammars.pre_attack_techniques_grammar.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.pre_attack_techniques_grammar.scan_string(text))
+    data = ioc_grammars.pre_attack_techniques_grammar.search_string(text)
     return _listify(data)
 
 
-def parse_enterprise_attack_mitigations(text):
+def parse_enterprise_attack_mitigations(text, include_positions=False):
     """."""
-    data = ioc_grammars.enterprise_attack_mitigations_grammar.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.enterprise_attack_mitigations_grammar.scan_string(text))
+    data = ioc_grammars.enterprise_attack_mitigations_grammar.search_string(text)
     return _listify(data)
 
 
-def parse_enterprise_attack_tactics(text):
+def parse_enterprise_attack_tactics(text, include_positions=False):
     """."""
-    data = ioc_grammars.enterprise_attack_tactics_grammar.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.enterprise_attack_tactics_grammar.scan_string(text))
+    data = ioc_grammars.enterprise_attack_tactics_grammar.search_string(text)
     return _listify(data)
 
 
-def parse_enterprise_attack_techniques(text):
+def parse_enterprise_attack_techniques(text, include_positions=False):
     """."""
-    data = ioc_grammars.enterprise_attack_techniques_grammar.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.enterprise_attack_techniques_grammar.scan_string(text))
+    data = ioc_grammars.enterprise_attack_techniques_grammar.search_string(text)
     return _listify(data)
 
 
-def parse_mobile_attack_mitigations(text):
+def parse_mobile_attack_mitigations(text, include_positions=False):
     """."""
-    data = ioc_grammars.mobile_attack_mitigations_grammar.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.mobile_attack_mitigations_grammar.scan_string(text))
+    data = ioc_grammars.mobile_attack_mitigations_grammar.search_string(text)
     return _listify(data)
 
 
-def parse_mobile_attack_tactics(text):
+def parse_mobile_attack_tactics(text, include_positions=False):
     """."""
-    data = ioc_grammars.mobile_attack_tactics_grammar.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.mobile_attack_tactics_grammar.scan_string(text))
+    data = ioc_grammars.mobile_attack_tactics_grammar.search_string(text)
     return _listify(data)
 
 
-def parse_mobile_attack_techniques(text):
+def parse_mobile_attack_techniques(text, include_positions=False):
     """."""
-    data = ioc_grammars.mobile_attack_techniques_grammar.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.mobile_attack_techniques_grammar.scan_string(text))
+    data = ioc_grammars.mobile_attack_techniques_grammar.search_string(text)
     return _listify(data)
 
 
-def parse_tlp_labels(text):
+def parse_tlp_labels(text, include_positions=False):
     """."""
-    tlp_labels = ioc_grammars.tlp_label.searchString(text)
+    if include_positions:
+        return _listify_with_positions(ioc_grammars.tlp_label.scan_string(text))
+    tlp_labels = ioc_grammars.tlp_label.search_string(text)
     return _listify(tlp_labels)
 
 
@@ -407,6 +541,7 @@ def parse_tlp_labels(text):
 )
 @click.option("--no_import_hashes", is_flag=True, help="Using this flag will not parse import hashes")
 @click.option("--no_authentihashes", is_flag=True, help="Using this flag will not parse authentihashes")
+@click.option("--include_positions", is_flag=True, help="Include the start and end positions of each match")
 def cli_find_iocs(
     text,
     no_url_domain_parsing,
@@ -417,6 +552,7 @@ def cli_find_iocs(
     parse_urls_without_scheme,
     no_import_hashes,
     no_authentihashes,
+    include_positions,
 ):
     """CLI interface for parsing observables."""
     stdin_text = click.get_text_stream("stdin")
@@ -436,6 +572,7 @@ def cli_find_iocs(
         parse_urls_without_scheme=parse_urls_without_scheme,
         parse_imphashes=not no_import_hashes,
         parse_authentihashes=not no_authentihashes,
+        include_positions=include_positions,
     )
     ioc_string = json.dumps(iocs, indent=4, sort_keys=True)
     print(ioc_string)
@@ -452,7 +589,8 @@ def find_iocs(  # noqa: CCR001 pylint: disable=R0912,R0915
     parse_urls_without_scheme: bool = True,
     parse_imphashes: bool = True,
     parse_authentihashes: bool = True,
-    included_ioc_types: List[str] = DEFAULT_IOC_TYPES,
+    included_ioc_types: list[str] = DEFAULT_IOC_TYPES,
+    include_positions: bool = False,
 ) -> IndicatorData:
     """Find observables (a.k.a. indicators of compromise) in the given text."""
     iocs = {}
@@ -463,43 +601,44 @@ def find_iocs(  # noqa: CCR001 pylint: disable=R0912,R0915
 
     # urls
     if "urls" in included_ioc_types:
-        iocs["urls"] = parse_urls(text, parse_urls_without_scheme=parse_urls_without_scheme)
+        iocs["urls"] = parse_urls(text, parse_urls_without_scheme=parse_urls_without_scheme, include_positions=include_positions)
+        url_values = _extract_values(iocs["urls"])
         if not parse_domain_from_url and not parse_from_url_path:
-            text = _remove_items(iocs["urls"], text)
+            text = _remove_items(url_values, text)
         elif not parse_domain_from_url:
-            text = _percent_decode_url(iocs["urls"], text)
-            text = _remove_url_domain_name(iocs["urls"], text)
+            text = _percent_decode_url(url_values, text)
+            text = _remove_url_domain_name(url_values, text)
         elif not parse_from_url_path:
-            text = _percent_decode_url(iocs["urls"], text)
-            text = _remove_url_paths(iocs["urls"], text)
+            text = _percent_decode_url(url_values, text)
+            text = _remove_url_paths(url_values, text)
         else:
-            text = _percent_decode_url(iocs["urls"], text)
+            text = _percent_decode_url(url_values, text)
 
     # xmpp addresses
     if "xmpp_addresses" in included_ioc_types:
-        iocs["xmpp_addresses"] = parse_xmpp_addresses(text)
+        iocs["xmpp_addresses"] = parse_xmpp_addresses(text, include_positions=include_positions)
 
     if "domains" in included_ioc_types and not parse_domain_name_from_xmpp_address:
-        xmpp_addresses = _get_items(iocs, "xmpp_addresses", parse_xmpp_addresses, text)
-        text = _remove_items(xmpp_addresses, text)
+        xmpp_addresses = _get_items(iocs, "xmpp_addresses", parse_xmpp_addresses, text, include_positions=include_positions)
+        text = _remove_items(_extract_values(xmpp_addresses), text)
     # even if we want to parse domain names from the xmpp_address,
     # we don't want them also being caught as email addresses so we'll remove everything before the `@`
     elif "email_addresses_complete" in included_ioc_types or "email_addresses" in included_ioc_types:
-        xmpp_addresses = _get_items(iocs, "xmpp_addresses", parse_xmpp_addresses, text)
+        xmpp_addresses = _get_items(iocs, "xmpp_addresses", parse_xmpp_addresses, text, include_positions=include_positions)
         text = _remove_xmpp_local_part(xmpp_addresses, text)
 
     # complete email addresses
     if "email_addresses_complete" in included_ioc_types:
-        iocs["email_addresses_complete"] = parse_complete_email_addresses(text)
+        iocs["email_addresses_complete"] = parse_complete_email_addresses(text, include_positions=include_positions)
     if "email_addresses" in included_ioc_types:
-        iocs["email_addresses"] = parse_email_addresses(text)
+        iocs["email_addresses"] = parse_email_addresses(text, include_positions=include_positions)
 
     if not parse_domain_from_email_address:
-        email_addresses_complete = _get_items(iocs, "email_addresses_complete", parse_complete_email_addresses, text)
-        email_addresses = _get_items(iocs, "email_addresses", parse_email_addresses, text)
+        email_addresses_complete = _get_items(iocs, "email_addresses_complete", parse_complete_email_addresses, text, include_positions=include_positions)
+        email_addresses = _get_items(iocs, "email_addresses", parse_email_addresses, text, include_positions=include_positions)
 
-        text = _remove_items(email_addresses_complete, text)
-        text = _remove_items(email_addresses, text)
+        text = _remove_items(_extract_values(email_addresses_complete), text)
+        text = _remove_items(_extract_values(email_addresses), text)
 
     if "ipv6s" in included_ioc_types:
         # after parsing the email addresses, we need to remove the
@@ -508,107 +647,109 @@ def find_iocs(  # noqa: CCR001 pylint: disable=R0912,R0915
 
     # cidr ranges
     if "ipv4_cidrs" in included_ioc_types:
-        iocs["ipv4_cidrs"] = parse_ipv4_cidrs(text)
+        iocs["ipv4_cidrs"] = parse_ipv4_cidrs(text, include_positions=include_positions)
 
     # remove URLs that are also ipv4_cidrs (see https://github.com/fhightower/ioc-finder/issues/91)
     url_parsing_requires_cidr_removal = "urls" in included_ioc_types and parse_urls_without_scheme
     ip_address_parsing_requires_cidr_removal = "ipv4s" in included_ioc_types and not parse_address_from_cidr
     if url_parsing_requires_cidr_removal or ip_address_parsing_requires_cidr_removal:
-        cidr_ranges = _get_items(iocs, "ipv4_cidrs", parse_ipv4_cidrs, text)
-        if url_parsing_requires_cidr_removal:
-            for cidr in cidr_ranges:
+        cidr_ranges = _get_items(iocs, "ipv4_cidrs", parse_ipv4_cidrs, text, include_positions=include_positions)
+        cidr_values = _extract_values(cidr_ranges)
+    if url_parsing_requires_cidr_removal:
+        if include_positions:
+            iocs["urls"] = [u for u in iocs["urls"] if u["value"] not in cidr_values]
+        else:
+            for cidr in cidr_values:
                 if cidr in iocs["urls"]:
                     iocs["urls"].remove(cidr)
-        if ip_address_parsing_requires_cidr_removal:
-            text = _remove_items(cidr_ranges, text)
+    if ip_address_parsing_requires_cidr_removal:
+        text = _remove_items(cidr_values, text)
 
     # file hashes
-    if "imphashes" in included_ioc_types:
-        if parse_imphashes:
-            iocs["imphashes"] = parse_imphashes_(text)
+    if "imphashes" in included_ioc_types and parse_imphashes:
+        iocs["imphashes"] = parse_imphashes_(text, include_positions=include_positions)
     if "md5s" in included_ioc_types:
         # remove the imphashes so they are not also parsed as md5s
-        imphashes = _get_items(iocs, "imphashes", parse_imphashes_, text)
-        text = _remove_items(imphashes, text)
+        imphashes = _get_items(iocs, "imphashes", parse_imphashes_, text, include_positions=include_positions)
+        text = _remove_items(_extract_values(imphashes), text)
 
-    if "authentihashes" in included_ioc_types:
-        if parse_authentihashes:
-            iocs["authentihashes"] = parse_authentihashes_(text)
+    if "authentihashes" in included_ioc_types and parse_authentihashes:
+        iocs["authentihashes"] = parse_authentihashes_(text, include_positions=include_positions)
     if "sha256s" in included_ioc_types:
         # remove the authentihashes so they are not also parsed as sha256s
-        authentihashes = _get_items(iocs, "authentihashes", parse_authentihashes_, text)
-        text = _remove_items(authentihashes, text)
+        authentihashes = _get_items(iocs, "authentihashes", parse_authentihashes_, text, include_positions=include_positions)
+        text = _remove_items(_extract_values(authentihashes), text)
 
     # domains
     if "domains" in included_ioc_types:
-        iocs["domains"] = parse_domain_names(text)
+        iocs["domains"] = parse_domain_names(text, include_positions=include_positions)
 
     # ip addresses
     if "ipv4s" in included_ioc_types:
-        iocs["ipv4s"] = parse_ipv4_addresses(text)
+        iocs["ipv4s"] = parse_ipv4_addresses(text, include_positions=include_positions)
     if "ipv6s" in included_ioc_types:
-        iocs["ipv6s"] = parse_ipv6_addresses(text)
+        iocs["ipv6s"] = parse_ipv6_addresses(text, include_positions=include_positions)
 
     # file hashes
     if "sha512s" in included_ioc_types:
-        iocs["sha512s"] = parse_sha512s(text)
+        iocs["sha512s"] = parse_sha512s(text, include_positions=include_positions)
     if "sha256s" in included_ioc_types:
-        iocs["sha256s"] = parse_sha256s(text)
+        iocs["sha256s"] = parse_sha256s(text, include_positions=include_positions)
     if "sha1s" in included_ioc_types:
-        iocs["sha1s"] = parse_sha1s(text)
+        iocs["sha1s"] = parse_sha1s(text, include_positions=include_positions)
     if "md5s" in included_ioc_types:
-        iocs["md5s"] = parse_md5s(text)
+        iocs["md5s"] = parse_md5s(text, include_positions=include_positions)
     if "ssdeeps" in included_ioc_types:
-        iocs["ssdeeps"] = parse_ssdeeps(text)
+        iocs["ssdeeps"] = parse_ssdeeps(text, include_positions=include_positions)
 
     # misc
     if "asns" in included_ioc_types:
-        iocs["asns"] = parse_asns(text)
+        iocs["asns"] = parse_asns(text, include_positions=include_positions)
     if "cves" in included_ioc_types:
-        iocs["cves"] = parse_cves(original_text)
+        iocs["cves"] = parse_cves(original_text, include_positions=include_positions)
     if "registry_key_paths" in included_ioc_types:
-        iocs["registry_key_paths"] = parse_registry_key_paths(text)
+        iocs["registry_key_paths"] = parse_registry_key_paths(text, include_positions=include_positions)
     if "google_adsense_publisher_ids" in included_ioc_types:
-        iocs["google_adsense_publisher_ids"] = parse_google_adsense_ids(text)
+        iocs["google_adsense_publisher_ids"] = parse_google_adsense_ids(text, include_positions=include_positions)
     if "google_analytics_tracker_ids" in included_ioc_types:
-        iocs["google_analytics_tracker_ids"] = parse_google_analytics_ids(text)
+        iocs["google_analytics_tracker_ids"] = parse_google_analytics_ids(text, include_positions=include_positions)
     if "bitcoin_addresses" in included_ioc_types:
-        iocs["bitcoin_addresses"] = parse_bitcoin_addresses(text)
+        iocs["bitcoin_addresses"] = parse_bitcoin_addresses(text, include_positions=include_positions)
     if "monero_addresses" in included_ioc_types:
-        iocs["monero_addresses"] = parse_monero_addresses(text)
+        iocs["monero_addresses"] = parse_monero_addresses(text, include_positions=include_positions)
     if "mac_addresses" in included_ioc_types:
-        iocs["mac_addresses"] = parse_mac_addresses(text)
+        iocs["mac_addresses"] = parse_mac_addresses(text, include_positions=include_positions)
     if "user_agents" in included_ioc_types:
-        iocs["user_agents"] = parse_user_agents(text)
+        iocs["user_agents"] = parse_user_agents(text, include_positions=include_positions)
     if "tlp_labels" in included_ioc_types:
-        iocs["tlp_labels"] = parse_tlp_labels(original_text)
+        iocs["tlp_labels"] = parse_tlp_labels(original_text, include_positions=include_positions)
 
     if "attack_mitigations" in included_ioc_types:
         iocs["attack_mitigations"] = {  # type: ignore
-            "enterprise": parse_enterprise_attack_mitigations(original_text),
-            "mobile": parse_mobile_attack_mitigations(original_text),
+            "enterprise": parse_enterprise_attack_mitigations(original_text, include_positions=include_positions),
+            "mobile": parse_mobile_attack_mitigations(original_text, include_positions=include_positions),
         }
 
     if "attack_tactics" in included_ioc_types:
         iocs["attack_tactics"] = {  # type: ignore
-            "pre_attack": parse_pre_attack_tactics(original_text),
-            "enterprise": parse_enterprise_attack_tactics(original_text),
-            "mobile": parse_mobile_attack_tactics(original_text),
+            "pre_attack": parse_pre_attack_tactics(original_text, include_positions=include_positions),
+            "enterprise": parse_enterprise_attack_tactics(original_text, include_positions=include_positions),
+            "mobile": parse_mobile_attack_tactics(original_text, include_positions=include_positions),
         }
 
     if "attack_techniques" in included_ioc_types:
         iocs["attack_techniques"] = {  # type: ignore
-            "pre_attack": parse_pre_attack_techniques(original_text),
-            "enterprise": parse_enterprise_attack_techniques(original_text),
-            "mobile": parse_mobile_attack_techniques(original_text),
+            "pre_attack": parse_pre_attack_techniques(original_text, include_positions=include_positions),
+            "enterprise": parse_enterprise_attack_techniques(original_text, include_positions=include_positions),
+            "mobile": parse_mobile_attack_techniques(original_text, include_positions=include_positions),
         }
 
     if "file_paths" in included_ioc_types:
         # if there are still url paths in the text, remove them so they don't get parsed as file names
         if parse_from_url_path:
-            urls = _get_items(iocs, "urls", parse_urls, text, parse_urls_without_scheme=parse_urls_without_scheme)
-            text = _remove_url_paths(urls, text)
+            urls = _get_items(iocs, "urls", parse_urls, text, parse_urls_without_scheme=parse_urls_without_scheme, include_positions=include_positions)
+            text = _remove_url_paths(_extract_values(urls), text)
 
-        iocs["file_paths"] = parse_file_paths(text)
+        iocs["file_paths"] = parse_file_paths(text, include_positions=include_positions)
 
     return iocs
